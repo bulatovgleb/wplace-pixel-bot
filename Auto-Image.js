@@ -1130,6 +1130,7 @@
     availableColors: [],
     activeColorPalette: [], // User-selected colors for conversion
     paintWhitePixels: true, // Default to ON
+	skipCorrectColorPixel: true, // Skip pixels already correct on canvas
     currentCharges: 0,
     maxCharges: 1, // Default max charges
     cooldown: CONFIG.COOLDOWN_DEFAULT,
@@ -2811,6 +2812,21 @@
         return false;
       }
     },
+	
+	// Check if a pixel on the original canvas already matches desired color
+	shouldSkipCorrectColor: async (tileRegionX, tileRegionY, pixelX, pixelY, desiredColorId) => {
+	  try {
+		const rgba = await overlayManager.getTilePixelColor(tileRegionX, tileRegionY, pixelX, pixelY).catch(() => null);
+		if (!rgba || !Array.isArray(rgba)) return false; // No data—do not skip
+		const [er, eg, eb] = rgba;
+		const existingId = findClosestColor([er, eg, eb], state.availableColors);
+		return existingId === desiredColorId;
+	  } catch {
+		return false;
+	  }
+	},
+
+	
   }
 
   // IMAGE PROCESSOR CLASS
@@ -7118,257 +7134,7 @@
     NotificationManager.syncFromState();
   }
 
-async function processImage() {
-  const { width, height, pixels } = state.imageData;
-  const { x: startX, y: startY } = state.startPosition;
-  const { x: regionX, y: regionY } = state.region;
-
-  const tThresh2 = state.customTransparencyThreshold || CONFIG.TRANSPARENCY_THRESHOLD;
-  const isEligibleAt = (x, y) => {
-    const idx = (y * width + x) * 4;
-    const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2], a = pixels[idx + 3];
-    if (a < tThresh2) return false;
-    if (!state.paintWhitePixels && Utils.isWhitePixel(r, g, b)) return false;
-    return true;
-  };
-
-  // Восстанавливаем место старта по прогрессу, чтобы не начинать всегда с (0,0)
-  let startRow = 0, startCol = 0, foundStart = false, seen = 0;
-  const target = Math.max(0, Math.min(state.paintedPixels || 0, width * height));
-  for (let y = 0; y < height && !foundStart; y++) {
-    for (let x = 0; x < width; x++) {
-      if (!isEligibleAt(x, y)) continue;
-      if (seen === target) { startRow = y; startCol = x; foundStart = true; break; }
-      seen++;
-    }
-  }
-  if (!foundStart) { startRow = height; startCol = 0; }
-
-  let pixelBatch = null;
-  let skippedPixels = { transparent: 0, white: 0, alreadyPainted: 0 };
-
-  try {
-    outerLoop: for (let y = startRow; y < height; y++) {
-      for (let x = (y === startRow ? startCol : 0); x < width; x++) {
-
-        if (state.stopFlag) {
-          // отправляем остаток перед стопом
-          if (pixelBatch && pixelBatch.pixels.length > 0) {
-            console.log(`🎯 Sending final batch before stop with ${pixelBatch.pixels.length} pixels`);
-            const ok = await sendBatchWithRetry(pixelBatch.pixels, pixelBatch.regionX, pixelBatch.regionY);
-            if (ok) {
-              pixelBatch.pixels.forEach(() => { state.paintedPixels++; });
-              state.currentCharges -= pixelBatch.pixels.length;
-              updateStats();
-            }
-          }
-          state.lastPosition = { x, y };
-          updateUI("paintingPaused", "warning", { x, y });
-          break outerLoop;
-        }
-
-        // Читаем целевой пиксель из палетизированных/дизеренных данных
-        const idx = (y * width + x) * 4;
-        const r = pixels[idx], g = pixels[idx + 1], b = pixels[idx + 2], a = pixels[idx + 3];
-
-        // Прозрачные и (если отключено) белые — скипаем
-        if (a < tThresh2 || (!state.paintWhitePixels && Utils.isWhitePixel(r, g, b))) {
-          if (a < tThresh2) skippedPixels.transparent++; else skippedPixels.white++;
-          continue;
-        }
-
-        // Цветовой id для сервера
-        const colorId = findClosestColor([r, g, b], state.availableColors);
-
-        // Абсолютные координаты на глобальном поле
-        const absX = startX + x;
-        const absY = startY + y;
-
-        // Разбивка на регионы 1000×1000
-        const adderX = Math.floor(absX / 1000);
-        const adderY = Math.floor(absY / 1000);
-        const pixelX = absX % 1000;
-        const pixelY = absY % 1000;
-
-        // Если меняем регион — сначала отправим накопленный батч
-        if (!pixelBatch ||
-            pixelBatch.regionX !== regionX + adderX ||
-            pixelBatch.regionY !== regionY + adderY) {
-
-          if (pixelBatch && pixelBatch.pixels.length > 0) {
-            console.log(`🌍 Sending region-change batch with ${pixelBatch.pixels.length} pixels (switching to region ${regionX + adderX},${regionY + adderY})`);
-            const ok = await sendBatchWithRetry(pixelBatch.pixels, pixelBatch.regionX, pixelBatch.regionY);
-            if (ok) {
-              pixelBatch.pixels.forEach(p => {
-                state.paintedPixels++;
-                Utils.markPixelPainted(p.x, p.y, pixelBatch.regionX, pixelBatch.regionY);
-              });
-              state.currentCharges -= pixelBatch.pixels.length;
-              updateUI("paintingProgress", "default", {
-                painted: state.paintedPixels,
-                total: state.totalPixels,
-              });
-              Utils.performSmartSave();
-              if (CONFIG.PAINTING_SPEED_ENABLED && state.paintingSpeed > 0) {
-                const batchDelayFactor = Math.max(1, 100 / state.paintingSpeed);
-                const totalDelay = Math.max(100, batchDelayFactor * pixelBatch.pixels.length);
-                await Utils.sleep(totalDelay);
-              }
-              updateStats();
-            } else {
-              console.error(`❌ Batch failed permanently after retries. Stopping painting.`);
-              state.stopFlag = true;
-              break outerLoop;
-            }
-          }
-
-          pixelBatch = {
-            regionX: regionX + adderX,
-            regionY: regionY + adderY,
-            pixels: []
-          };
-        }
-
-        // === Correct Color Pixel Skip ===
-        // Смотрим фактический цвет на слое карты; если уже правильный — пропускаем
-        try {
-          const tileKeyX = regionX + adderX;
-          const tileKeyY = regionY + adderY;
-          const existingColorRGBA = await overlayManager
-            .getTilePixelColor(tileKeyX, tileKeyY, pixelX, pixelY)
-            .catch(() => null);
-          if (existingColorRGBA && Array.isArray(existingColorRGBA)) {
-            const [er, eg, eb] = existingColorRGBA;
-            const existingColorId = findClosestColor([er, eg, eb], state.availableColors);
-            if (existingColorId === colorId) {
-              skippedPixels.alreadyPainted++;
-              // console.log(`Skipped already painted pixel at (${pixelX}, ${pixelY})`);
-              continue;
-            }
-          }
-        } catch (e) {
-          // Игнорируем проблемы чтения тайла, просто не скипаем в этом случае
-        }
-
-        // Добавляем пиксель в батч
-        pixelBatch.pixels.push({
-          x: pixelX,
-          y: pixelY,
-          color: colorId,
-          localX: x,
-          localY: y,
-        });
-
-        // Достижение размера батча — отправка
-        const maxBatchSize = calculateBatchSize();
-        if (pixelBatch.pixels.length >= maxBatchSize) {
-          const modeText = state.batchMode === 'random'
-            ? `random (${state.randomBatchMin}-${state.randomBatchMax})`
-            : 'normal';
-          console.log(`📦 Sending batch with ${pixelBatch.pixels.length} pixels (mode: ${modeText}, target: ${maxBatchSize})`);
-          const ok = await sendBatchWithRetry(pixelBatch.pixels, pixelBatch.regionX, pixelBatch.regionY);
-          if (ok) {
-            pixelBatch.pixels.forEach(pixel => {
-              state.paintedPixels++;
-              Utils.markPixelPainted(pixel.x, pixel.y, pixelBatch.regionX, pixelBatch.regionY);
-            });
-            state.currentCharges -= pixelBatch.pixels.length;
-            updateStats();
-            updateUI("paintingProgress", "default", {
-              painted: state.paintedPixels,
-              total: state.totalPixels,
-            });
-            Utils.performSmartSave();
-            if (CONFIG.PAINTING_SPEED_ENABLED && state.paintingSpeed > 0) {
-              const delayPerPixel = 1000 / state.paintingSpeed;
-              const totalDelay = Math.max(100, delayPerPixel * pixelBatch.pixels.length);
-              await Utils.sleep(totalDelay);
-            }
-          } else {
-            console.error(`❌ Batch failed permanently after retries. Stopping painting.`);
-            state.stopFlag = true;
-            break outerLoop;
-          }
-          pixelBatch.pixels = [];
-        }
-
-        // Ожидание подзарядки, если ниже порога
-        while (state.currentCharges < state.cooldownChargeThreshold && !state.stopFlag) {
-          const { charges, cooldown } = await WPlaceService.getCharges();
-          state.currentCharges = Math.floor(charges);
-          state.cooldown = cooldown;
-
-          if (state.currentCharges >= state.cooldownChargeThreshold) {
-            NotificationManager.maybeNotifyChargesReached(true);
-            updateStats();
-            break;
-          }
-
-          saveBtn.disabled = false;
-          updateUI("noChargesThreshold", "warning", {
-            time: Utils.formatTime(state.cooldown),
-            threshold: state.cooldownChargeThreshold,
-            current: state.currentCharges
-          });
-          await updateStats();
-          Utils.performSmartSave();
-          await Utils.sleep(state.cooldown);
-        }
-        if (!state.stopFlag) saveBtn.disabled = true;
-        if (state.stopFlag) break outerLoop;
-      }
-    }
-
-    // Финальный батч
-    if (pixelBatch && pixelBatch.pixels.length > 0 && !state.stopFlag) {
-      console.log(`🏁 Sending final batch with ${pixelBatch.pixels.length} pixels`);
-      const ok = await sendBatchWithRetry(pixelBatch.pixels, pixelBatch.regionX, pixelBatch.regionY);
-      if (ok) {
-        pixelBatch.pixels.forEach(pixel => {
-          state.paintedPixels++;
-          Utils.markPixelPainted(pixel.x, pixel.y, pixelBatch.regionX, pixelBatch.regionY);
-        });
-        state.currentCharges -= pixelBatch.pixels.length;
-        Utils.saveProgress();
-        if (CONFIG.PAINTING_SPEED_ENABLED && state.paintingSpeed > 0) {
-          const delayPerPixel = 1000 / state.paintingSpeed;
-          const totalDelay = Math.max(100, delayPerPixel * pixelBatch.pixels.length);
-          await Utils.sleep(totalDelay);
-        }
-      } else {
-        console.warn(`⚠️ Final batch failed with ${pixelBatch.pixels.length} pixels after all retries.`);
-      }
-    }
-  } finally {
-    if (window._chargesInterval) clearInterval(window._chargesInterval);
-    window._chargesInterval = null;
-  }
-
-  if (state.stopFlag) {
-    updateUI("paintingStopped", "warning");
-    Utils.saveProgress();
-  } else {
-    updateUI("paintingComplete", "success", { count: state.paintedPixels });
-    state.lastPosition = { x: 0, y: 0 };
-    Utils.saveProgress();
-    overlayManager.clear();
-    const toggleOverlayBtn = document.getElementById('toggleOverlayBtn');
-    if (toggleOverlayBtn) {
-      toggleOverlayBtn.classList.remove('active');
-      toggleOverlayBtn.disabled = true;
-    }
-  }
-
-  // Лог статистики по пропускам — смотри в консоли
-  console.log(`📊 Pixel Statistics:`);
-  console.log(`   Painted: ${state.paintedPixels}`);
-  console.log(`   Skipped - Transparent: ${skippedPixels.transparent}`);
-  console.log(`   Skipped - White (disabled): ${skippedPixels.white}`);
-  console.log(`   Skipped - Already painted: ${skippedPixels.alreadyPainted}`);
-  console.log(`   Total processed: ${state.paintedPixels + skippedPixels.transparent + skippedPixels.white + skippedPixels.alreadyPainted}`);
-
-  updateStats();
-}
+  async function processImage() {
     const { width, height, pixels } = state.imageData
     const { x: startX, y: startY } = state.startPosition
     const { x: regionX, y: regionY } = state.region
@@ -7501,17 +7267,16 @@ async function processImage() {
             const tileRegionX = pixelBatch ? (pixelBatch.regionX) : (regionX + adderX);
             const tileRegionY = pixelBatch ? (pixelBatch.regionY) : (regionY + adderY);
             const tileKeyParts = [(regionX + adderX), (regionY + adderY)];
-            const existingColorRGBA = await overlayManager.getTilePixelColor(tileKeyParts[0], tileKeyParts[1], pixelX, pixelY).catch(() => null);
-            if (existingColorRGBA && Array.isArray(existingColorRGBA)) {
-              const [er, eg, eb] = existingColorRGBA;
-              const existingColorId = findClosestColor([er, eg, eb], state.availableColors);
-              // console.log(`pixel at (${pixelX}, ${pixelY}) has color ${existingColorId} it should be ${colorId}`);
-              if (existingColorId === colorId) {
-                skippedPixels.alreadyPainted++;
-                console.log(`Skipped already painted pixel at (${pixelX}, ${pixelY})`);
-                continue; // Skip
-              }
-            }
+			if (state.skipCorrectColorPixel) {
+			  const tileRegionX = pixelBatch ? (pixelBatch.regionX) : (regionX + adderX);
+			  const tileRegionY = pixelBatch ? (pixelBatch.regionY) : (regionY + adderY);
+			  const shouldSkip = await Utils.shouldSkipCorrectColor(tileRegionX, tileRegionY, pixelX, pixelY, colorId);
+			  if (shouldSkip) {
+				skippedPixels.alreadyPainted++;
+				console.log(`Skipped already painted pixel at (${pixelX}, ${pixelY})`);
+				continue;
+			  }
+			}
           } catch (e) {
             /* ignore */
           }
@@ -7815,6 +7580,7 @@ async function processImage() {
         tokenSource: state.tokenSource, // "generator", "hybrid", or "manual"
         minimized: state.minimized,
         overlayOpacity: state.overlayOpacity,
+		skipCorrectColorPixel: state.skipCorrectColorPixel,
         blueMarbleEnabled: document.getElementById('enableBlueMarbleToggle')?.checked,
   ditheringEnabled: state.ditheringEnabled,
   colorMatchingAlgorithm: state.colorMatchingAlgorithm,
@@ -7850,6 +7616,7 @@ async function processImage() {
       if (!saved) return;
       const settings = JSON.parse(saved);
 
+	  state.skipCorrectColorPixel = settings.skipCorrectColorPixel ?? true;
       state.paintingSpeed = settings.paintingSpeed || CONFIG.PAINTING_SPEED.DEFAULT;
       state.batchMode = settings.batchMode || CONFIG.BATCH_MODE; // Default to "normal"
       state.randomBatchMin = settings.randomBatchMin || CONFIG.RANDOM_BATCH_RANGE.MIN;
